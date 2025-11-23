@@ -1,9 +1,8 @@
 # Copyright (c) [2025] [Mathesh Vaithiyanathan]
 # This software is licensed under the MIT License.
 # See the LICENSE file for details.
-
-import os
 import resources_rc
+import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -31,7 +30,7 @@ import ctypes
 import pyqtgraph as pg
 import matplotlib
 import pandas as pd
-from scipy.interpolate import RectBivariateSpline, UnivariateSpline, interp1d
+from scipy.interpolate import RectBivariateSpline, UnivariateSpline, interp1d, griddata
 from lmfit.printfuncs import report_fit
 
 print(f"Matplotlib Version: {matplotlib.__version__}")
@@ -85,6 +84,68 @@ def _parse_label_and_unit(label_string):
         unit = match.group(2).strip( )
         return label, unit
     return label_string, ''
+
+
+def _build_single_component_pfid_terms(T_new, ν, T2, ν10, ν21, r):
+    c = 2.998e10
+
+    T_sec = T_new * 1e-12
+    T2_sec = T2 * 1e-12
+
+    exp_factor = np.exp(-T_sec [ :, None ] / T2_sec)
+
+    term1_numerator = (1 / (T2 * 1e-12)) * np.cos(2 * np.pi * c * (ν - ν10) * T_sec [ :, None ]) - \
+                      2 * np.pi * c * (ν - ν10) * np.sin(2 * np.pi * c * (ν - ν10) * T_sec [ :, None ])
+    term1_denominator = (2 * np.pi * c * (ν - ν10)) ** 2 + (1 / T2_sec) ** 2
+    term1 = exp_factor * (term1_numerator / term1_denominator)
+
+    term2_numerator_orig = (1 / (T2 * 1e-12)) * np.cos(2 * np.pi * c * (ν - ν10) * T_sec [ :, None ]) - \
+                           2 * np.pi * c * (ν - ν21) * np.sin(2 * np.pi * c * (ν - ν10) * T_sec [ :, None ])
+    term2_denominator_orig = (2 * np.pi * c * (ν - ν21)) ** 2 + (1 / T2_sec) ** 2
+
+    term2 = -r * exp_factor * (term2_numerator_orig / term2_denominator_orig)
+
+    return term1.ravel( ), term2.ravel( )
+
+
+def build_design_matrix_pfid(T_new, ν, component_params, r_values):
+    all_terms = [ ]
+
+    for i, (T2, ν10, ν21) in enumerate(component_params):
+        r = r_values [ i ]
+
+        term1_ravel, term2_ravel = _build_single_component_pfid_terms(T_new, ν, T2, ν10, ν21, r)
+
+        all_terms.append(term1_ravel)
+        all_terms.append(term2_ravel)
+
+    n_T = T_new.size
+    n_ν = ν.size
+    offset_term = np.ones((n_T, n_ν)).ravel( )
+    all_terms.append(offset_term)
+
+    return np.column_stack(all_terms)
+
+
+def residual_pfid(params, T_new, ν, data, num_components):
+    component_params = [ ]
+    r_values = [ ]
+
+    for i in range(num_components):
+        comp_idx = i + 1
+        T2 = params [ f'T2_{comp_idx}' ].value
+        ν10 = params [ f'ν10_{comp_idx}' ].value
+        ν21 = params [ f'ν21_{comp_idx}' ].value
+        r_values.append(params [ f'r_{comp_idx}' ].value)
+        component_params.append((T2, ν10, ν21))
+
+    A = build_design_matrix_pfid(T_new, ν, component_params, r_values)
+    y = data.ravel( )
+
+    amplitudes = lstsq(A, y) [ 0 ]
+
+    model = A @ amplitudes
+    return (model - y)
 
 
 class AnalysisWorker(QThread):
@@ -217,6 +278,513 @@ class AnalysisWorker(QThread):
             best_fwhm, None, use_convolved_model, initial_tau_guesses_for_print, fit_report_string, warnings)
 
 
+class PFIDFitWorker(QThread):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, params):
+        super( ).__init__( )
+        self.params = params
+
+    def run(self):
+        try:
+            results = self.run_pfid_fit_analysis(**self.params)
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(f"PFID Fit Error: {e}")
+
+    def run_pfid_fit_analysis(self, time_min, time_max, probe_min, probe_max,
+                              num_components, T2_params, nu10_params, nu21_params, r_params,
+                              interp_method, num_interp_points,
+                              x_axis, y_axis, two_d_spectrum):
+
+        if x_axis is None or y_axis is None or two_d_spectrum is None:
+            raise ValueError("Data not provided to the analysis worker.")
+
+        T2_guesses, T2_fix_flags = T2_params
+        nu10_guesses, nu10_fix_flags = nu10_params
+        nu21_guesses, nu21_fix_flags = nu21_params
+        r_guesses, r_fix_flags = r_params
+
+        try:
+            time_min_idx = find(y_axis, time_min)
+            time_max_idx = find(y_axis, time_max)
+            probe_min_idx = find(x_axis, probe_min)
+            probe_max_idx = find(x_axis, probe_max)
+
+            data_raw_sliced = two_d_spectrum [ time_min_idx:time_max_idx + 1, probe_min_idx:probe_max_idx + 1 ]
+            time_raw_sliced = y_axis [ time_min_idx:time_max_idx + 1 ]
+            probe_raw_sliced = x_axis [ probe_min_idx:probe_max_idx + 1 ]
+        except IndexError:
+            raise IndexError("The provided slicing range is outside the loaded data boundaries.")
+
+        T_orig = np.abs(time_raw_sliced)
+        ω_orig = probe_raw_sliced
+        data_orig = data_raw_sliced
+
+        T_grid, ω_grid = np.meshgrid(T_orig, ω_orig, indexing = 'ij')
+        points = np.column_stack((T_grid.ravel( ), ω_grid.ravel( )))
+        values = data_orig.ravel( )
+
+        T_new = np.linspace(np.min(T_orig), np.max(T_orig), num_interp_points)
+        ω_new = np.linspace(np.min(ω_orig), np.max(ω_orig), num_interp_points)
+        T_new_grid, ω_new_grid = np.meshgrid(T_new, ω_new, indexing = 'ij')
+
+        interpolated_data = griddata(
+            points = points,
+            values = values,
+            xi = (T_new_grid, ω_new_grid),
+            method = interp_method,
+            fill_value = 0
+        )
+        data_interp = interpolated_data
+
+        params = lmfit.Parameters( )
+
+        for i in range(num_components):
+            comp_idx = i + 1
+
+            params.add(f'T2_{comp_idx}', value = T2_guesses [ i ], min = 0.01, max = 30,
+                       vary = not T2_fix_flags [ i ])
+
+            params.add(f'ν10_{comp_idx}', value = nu10_guesses [ i ], min = np.min(ω_new), max = np.max(ω_new),
+                       vary = not nu10_fix_flags [ i ])
+
+            params.add(f'ν21_{comp_idx}', value = nu21_guesses [ i ], min = np.min(ω_new), max = np.max(ω_new),
+                       vary = not nu21_fix_flags [ i ])
+
+            params.add(f'r_{comp_idx}', value = r_guesses [ i ], min = 0.0, max = 1.0,
+                       vary = not r_fix_flags [ i ])
+
+        minimizer = lmfit.Minimizer(residual_pfid, params, fcn_args = (T_new, ω_new, data_interp, num_components))
+        result = minimizer.minimize(method = 'leastsq')
+
+        best_params_list = [ ]
+        best_r_list = [ ]
+        for i in range(num_components):
+            comp_idx = i + 1
+            best_T2 = result.params [ f'T2_{comp_idx}' ].value
+            best_nu10 = result.params [ f'ν10_{comp_idx}' ].value
+            best_nu21 = result.params [ f'ν21_{comp_idx}' ].value
+            best_r = result.params [ f'r_{comp_idx}' ].value
+            best_params_list.append((best_T2, best_nu10, best_nu21))
+            best_r_list.append(best_r)
+
+        A_final = lstsq(build_design_matrix_pfid(T_new, ω_new, best_params_list, best_r_list),
+                        data_interp.ravel( )) [ 0 ]
+
+        best_fit_flat = build_design_matrix_pfid(T_new, ω_new, best_params_list, best_r_list) @ A_final
+        best_fit = best_fit_flat.reshape(data_interp.shape)
+
+        ss_res = np.sum((best_fit_flat - data_interp.ravel( )) ** 2)
+        ss_tot = np.sum((data_interp - np.mean(data_interp)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot)
+
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = buffer = io.StringIO( )
+        try:
+            report_fit(result)
+            fit_report_string = buffer.getvalue( )
+        finally:
+            sys.stdout = old_stdout
+
+        return (best_fit, A_final, r_squared, ω_new, T_new, data_interp, fit_report_string, result, num_components)
+
+
+class PFIDFitterApp(QWidget):
+    def __init__(self, main_window, x_axis_label='Probe wavenumber', y_axis_label='Time', x_axis_unit='cm\u207B\u00B9',
+                 y_axis_unit='ps',
+                 font_size=12):
+        super( ).__init__(main_window)
+        self.setWindowTitle("PFID (Photon-Frequency-ID) Fitting Analysis")
+        self.setObjectName("PFID Fit")
+
+        self.main_window = main_window
+
+        self.x_axis_label = x_axis_label
+        self.y_axis_label = y_axis_label
+        self.x_axis_unit = x_axis_unit
+        self.y_axis_unit = y_axis_unit
+        self.font_size = font_size
+        self.worker_thread = None
+
+        self.x_axis_data = None
+        self.y_axis_data = None
+        self.two_d_spectrum_data = None
+
+        self.initUI( )
+        self.results_data = None
+
+    def initUI(self):
+        main_layout = QGridLayout(self)
+
+        input_panel = QGroupBox("PFID Model Parameters & Range")
+        input_layout = QVBoxLayout(input_panel)
+
+        formatted_x_unit = _format_unit_for_display(self.x_axis_unit)
+        formatted_y_unit = _format_unit_for_display(self.y_axis_unit)
+
+        grid_range = QGridLayout( )
+        grid_range.addWidget(QLabel(f"{self.y_axis_label} Min (must be negative, {formatted_y_unit}):"), 0, 0)
+        self.time_min_input = QLineEdit("-15.0")
+        grid_range.addWidget(self.time_min_input, 0, 1)
+        grid_range.addWidget(QLabel(f"{self.y_axis_label} Max (must be negative, {formatted_y_unit}):"), 0, 2)
+        self.time_max_input = QLineEdit("-0.5")
+        grid_range.addWidget(self.time_max_input, 0, 3)
+
+        grid_range.addWidget(QLabel(f"{self.x_axis_label} Min ({formatted_x_unit}):"), 1, 0)
+        self.probe_min_input = QLineEdit("1775")
+        grid_range.addWidget(self.probe_min_input, 1, 1)
+        grid_range.addWidget(QLabel(f"{self.x_axis_label} Max ({formatted_x_unit}):"), 1, 2)
+        self.probe_max_input = QLineEdit("1850")
+        grid_range.addWidget(self.probe_max_input, 1, 3)
+        input_layout.addLayout(grid_range)
+
+        grid_model_comp = QGridLayout( )
+        grid_model_comp.addWidget(QLabel("Number of PFID Components:"), 0, 0)
+        self.num_components_input = QLineEdit("1")
+        self.num_components_input.setValidator(QIntValidator(1, 5))
+        grid_model_comp.addWidget(self.num_components_input, 0, 1)
+
+        fix_help_label = QLabel("Note: Append ':' to a value to fix it (e.g., 2.0:, 1810:, 0.2:)")
+        fix_help_label.setStyleSheet("color: blue;")
+        grid_model_comp.addWidget(fix_help_label, 0, 2, 1, 2)
+
+        input_layout.addLayout(grid_model_comp)
+
+        grid_guesses = QGridLayout( )
+        grid_guesses.addWidget(QLabel("T₂ Guesses (ps, comma-separated):"), 0, 0)
+        self.T2_guess_input = QLineEdit("2.0")
+        grid_guesses.addWidget(self.T2_guess_input, 0, 1, 1, 2)
+
+        grid_guesses.addWidget(QLabel(f"ν₁₀ Guesses ({formatted_x_unit}, comma-separated):"), 1, 0)
+        self.nu10_guess_input = QLineEdit("1810")
+        grid_guesses.addWidget(self.nu10_guess_input, 1, 1, 1, 2)
+
+        grid_guesses.addWidget(QLabel(f"ν₂₁ Guesses ({formatted_x_unit}, comma-separated):"), 2, 0)
+        self.nu21_guess_input = QLineEdit("1785")
+        grid_guesses.addWidget(self.nu21_guess_input, 2, 1, 1, 2)
+
+        grid_guesses.addWidget(QLabel("r (Ratio) Guesses (comma-separated):"), 3, 0)
+        self.r_guess_input = QLineEdit("0.2")
+        grid_guesses.addWidget(self.r_guess_input, 3, 1, 1, 2)
+
+        input_layout.addLayout(grid_guesses)
+
+        interp_group = QGroupBox("Interpolation Settings (for fit matrix)")
+        interp_layout = QGridLayout(interp_group)
+
+        interp_layout.addWidget(QLabel("Method:"), 0, 0)
+        self.interp_method_combo = QComboBox(self)
+        self.interp_method_combo.addItems([ "linear", "cubic", "nearest" ])
+        self.interp_method_combo.setCurrentText("cubic")
+        interp_layout.addWidget(self.interp_method_combo, 0, 1)
+
+        interp_layout.addWidget(QLabel("Points per Dimension:"), 1, 0)
+        self.interp_points_input = QSpinBox(self)
+        self.interp_points_input.setRange(20, 1000)
+        self.interp_points_input.setValue(100)
+        interp_layout.addWidget(self.interp_points_input, 1, 1)
+
+        input_layout.addWidget(interp_group)
+
+        button_layout = QHBoxLayout( )
+        self.run_button = QPushButton("Run PFID Fit")
+        self.run_button.clicked.connect(self.run_pfid_fit)
+        button_layout.addWidget(self.run_button)
+
+        self.export_button = QPushButton("Export Results")
+        self.export_button.clicked.connect(self.export_fit_results)
+        self.export_button.setDisabled(True)
+        button_layout.addWidget(self.export_button)
+
+        input_layout.addLayout(button_layout)
+
+        main_layout.addWidget(input_panel, 0, 0, 1, 1, Qt.AlignTop)
+
+        results_panel = QGroupBox("Fit Report")
+        results_layout = QVBoxLayout(results_panel)
+        self.results_text_edit = QTextEdit( )
+        self.results_text_edit.setReadOnly(True)
+        self.results_text_edit.setMinimumHeight(300)
+        results_layout.addWidget(self.results_text_edit)
+
+        main_layout.addWidget(results_panel, 0, 1, 1, 1, Qt.AlignTop)
+
+        self.plot_container = QWidget( )
+        self.plot_layout = QHBoxLayout(self.plot_container)
+        main_layout.addWidget(self.plot_container, 1, 0, 1, 2)
+        main_layout.setRowStretch(1, 10)
+        self.setLayout(main_layout)
+
+    def parse_fixed_float_list_gui(self, text, name, num_components):
+        vals_str = [ v.strip( ) for v in text.split(',') if v.strip( ) ]
+
+        if len(vals_str) != num_components:
+            raise ValueError(
+                f"Number of {name} guesses ({len(vals_str)}) must match number of components ({num_components}).")
+
+        values = [ ]
+        fix_flags = [ ]
+        for v_str in vals_str:
+            is_fixed = False
+            v_str_clean = v_str
+            if v_str.endswith(':'):
+                is_fixed = True
+                v_str_clean = v_str [ :-1 ]
+
+            try:
+                values.append(float(v_str_clean))
+                fix_flags.append(is_fixed)
+            except ValueError:
+                raise ValueError(f"Invalid number format in {name}: '{v_str}' is not a valid float.")
+
+        return values, fix_flags
+
+    def run_pfid_fit(self):
+        if self.main_window and hasattr(self.main_window, 'data_loaded') and self.main_window.data_loaded:
+            self.x_axis_data = self.main_window.current_x_values
+            self.y_axis_data = self.main_window.current_y_values
+            self.two_d_spectrum_data = self.main_window.current_signal_data
+
+        if self.x_axis_data is None:
+            QMessageBox.critical(self, "No Data", "No 2D data is currently loaded in the main application for fitting.")
+            return
+
+        try:
+            num_components = int(self.num_components_input.text( ))
+            if num_components < 1:
+                raise ValueError("Number of PFID Components must be 1 or greater.")
+
+            T2_params = self.parse_fixed_float_list_gui(self.T2_guess_input.text( ), "T2", num_components)
+            nu10_params = self.parse_fixed_float_list_gui(self.nu10_guess_input.text( ), "ν10", num_components)
+            nu21_params = self.parse_fixed_float_list_gui(self.nu21_guess_input.text( ), "ν21", num_components)
+            r_params = self.parse_fixed_float_list_gui(self.r_guess_input.text( ), "r", num_components)
+
+            params = {
+                "time_min": float(self.time_min_input.text( )),
+                "time_max": float(self.time_max_input.text( )),
+                "probe_min": float(self.probe_min_input.text( )),
+                "probe_max": float(self.probe_max_input.text( )),
+                "num_components": num_components,
+                "T2_params": T2_params,
+                "nu10_params": nu10_params,
+                "nu21_params": nu21_params,
+                "r_params": r_params,
+                "interp_method": self.interp_method_combo.currentText( ),
+                "num_interp_points": self.interp_points_input.value( ),
+                "x_axis": self.x_axis_data,
+                "y_axis": self.y_axis_data,
+                "two_d_spectrum": self.two_d_spectrum_data,
+            }
+
+            if params [ "time_min" ] >= 0 or params [ "time_max" ] >= 0:
+                QMessageBox.warning(self, "Input Warning",
+                                    "PFID fit typically requires a **negative** time range (e.g., -15 to -0.5 ps). Please confirm your input is correct.")
+
+            self.results_text_edit.setText(
+                "Running fit... Please wait. This may take a moment due to grid interpolation and minimization.")
+            self.run_button.setDisabled(True)
+            self.export_button.setDisabled(True)
+
+            self.worker_thread = PFIDFitWorker(params)
+            self.worker_thread.finished.connect(self.plot_results)
+            self.worker_thread.error.connect(self.handle_error)
+            self.worker_thread.start( )
+
+        except ValueError as ve:
+            QMessageBox.critical(self, "Input Error", f"Invalid number format or parameter count: {ve}")
+            self.run_button.setDisabled(False)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+            self.run_button.setDisabled(False)
+
+    def plot_results(self, results):
+        self.run_button.setDisabled(False)
+        self.export_button.setDisabled(False)
+
+        (best_fit, A_final, r_squared, probe, time, data_interp, fit_report_string, result, num_components) = results
+        self.results_data = results
+
+        A_offset = A_final [ -1 ]
+
+        output_text = "--- PFID Fit Results ---\n\n"
+        output_text += f"Number of Components Fitted: {num_components}\n"
+        output_text += f"Overall R-squared value: {r_squared:.4f}\n"
+
+        for i in range(num_components):
+            A1 = A_final [ i * 2 ]
+            A2 = A_final [ i * 2 + 1 ]
+            output_text += f"Component {i + 1} Amplitudes: A₁ = {A1:.2g}, A₂ = {A2:.2g}\n"
+
+        output_text += f"Overall Offset: {A_offset:.2g}\n\n"
+        output_text += "--- Full lmfit Report ---\n"
+        output_text += fit_report_string
+        self.results_text_edit.setText(output_text)
+
+        for i in reversed(range(self.plot_layout.count( ))):
+            self.plot_layout.itemAt(i).widget( ).setParent(None)
+
+        font_size = self.font_size
+        plt.rcParams.update({ 'font.size': font_size })
+
+        formatted_x_unit = _format_unit_for_display(self.x_axis_unit)
+        formatted_y_unit = _format_unit_for_display(self.y_axis_unit)
+
+        plot1_container = QWidget( )
+        plot1_vbox = QVBoxLayout(plot1_container)
+
+        fig1 = Figure(figsize = (5, 5), dpi = 100)
+        canvas1 = FigureCanvas(fig1)
+        toolbar1 = NavigationToolbar(canvas1, plot1_container)
+
+        ax1 = fig1.add_subplot(111)
+
+        vmin, vmax = data_interp.min( ), data_interp.max( )
+        norm = plt.Normalize(vmin = vmin, vmax = vmax)
+
+        im1 = ax1.pcolormesh(probe, time, data_interp, cmap = 'seismic', shading = 'auto', norm = norm)
+        ax1.set_title('Interpolated Original Data')
+        ax1.set_xlabel(f'{self.x_axis_label} ({formatted_x_unit})')
+        ax1.set_ylabel(f'|{self.y_axis_label}| ({formatted_y_unit})')
+        fig1.colorbar(im1, ax = ax1, label = 'Signal')
+        fig1.tight_layout( )
+
+        plot1_vbox.addWidget(toolbar1)
+        plot1_vbox.addWidget(canvas1)
+        self.plot_layout.addWidget(plot1_container)
+
+        plot2_container = QWidget( )
+        plot2_vbox = QVBoxLayout(plot2_container)
+
+        fig2 = Figure(figsize = (5, 5), dpi = 100)
+        canvas2 = FigureCanvas(fig2)
+        toolbar2 = NavigationToolbar(canvas2, plot2_container)
+
+        ax2 = fig2.add_subplot(111)
+        im2 = ax2.pcolormesh(probe, time, best_fit, cmap = 'seismic', shading = 'auto', norm = norm)
+        ax2.set_title('Fitted Model')
+        ax2.set_xlabel(f'{self.x_axis_label} ({formatted_x_unit})')
+        fig2.colorbar(im2, ax = ax2, label = 'Signal')
+        fig2.tight_layout( )
+
+        plot2_vbox.addWidget(toolbar2)
+        plot2_vbox.addWidget(canvas2)
+        self.plot_layout.addWidget(plot2_container)
+
+        plot3_container = QWidget( )
+        plot3_vbox = QVBoxLayout(plot3_container)
+
+        residuals = data_interp - best_fit
+        fig3 = Figure(figsize = (5, 5), dpi = 100)
+        canvas3 = FigureCanvas(fig3)
+        toolbar3 = NavigationToolbar(canvas3, plot3_container)
+
+        ax3 = fig3.add_subplot(111)
+
+        res_max_abs = np.abs(residuals).max( )
+        res_norm = plt.Normalize(vmin = -res_max_abs, vmax = res_max_abs)
+
+        im3 = ax3.pcolormesh(probe, time, residuals, cmap = 'seismic', shading = 'auto', norm = res_norm)
+        ax3.set_title('Residuals (Data - Fit)')
+        ax3.set_xlabel(f'{self.x_axis_label} ({formatted_x_unit})')
+        fig3.colorbar(im3, ax = ax3, label = 'Residual Signal')
+        fig3.tight_layout( )
+
+        plot3_vbox.addWidget(toolbar3)
+        plot3_vbox.addWidget(canvas3)
+        self.plot_layout.addWidget(plot3_container)
+
+    def handle_error(self, message):
+        self.run_button.setDisabled(False)
+        self.export_button.setDisabled(True)
+        QMessageBox.critical(self, "PFID Analysis Error", message)
+        self.results_text_edit.setText(f"ERROR: {message}")
+
+    def export_fit_results(self):
+        if self.results_data is None:
+            QMessageBox.warning(self, "No Data", "Please run the PFID fit analysis before exporting.")
+            return
+
+        (best_fit, A_final, r_squared, probe, time, data_interp, fit_report_string, result,
+         num_components) = self.results_data
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save PFID Fit Data", "", "CSV Files (*.csv)"
+        )
+
+        if not file_path:
+            return
+
+        dir_name = os.path.dirname(file_path)
+        base_name = os.path.basename(file_path).split('.') [ 0 ]
+
+        try:
+            report_path = os.path.join(dir_name, f"{base_name}_PFID_report.txt")
+            with open(report_path, 'w', encoding = 'utf-8') as f:
+                f.write(fit_report_string)
+
+            header = [ "Time (abs_ps)" ] + [ f"{p:.2f} ({self.x_axis_unit})" for p in probe ]
+
+            data_to_export = np.hstack((time [ :, np.newaxis ], data_interp))
+            fit_to_export = np.hstack((time [ :, np.newaxis ], best_fit))
+
+            data_df = pd.DataFrame(data_to_export, columns = header)
+            fit_df = pd.DataFrame(fit_to_export, columns = header)
+
+            data_df.to_csv(os.path.join(dir_name, f"{base_name}_PFID_interpolated_data.csv"), index = False,
+                           encoding = 'utf-8')
+            fit_df.to_csv(os.path.join(dir_name, f"{base_name}_PFID_fitted_data.csv"), index = False,
+                          encoding = 'utf-8')
+
+            QMessageBox.information(
+                self, "Export Successful",
+                f"PFID fit results exported to multiple files in the directory:\n{dir_name}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"An error occurred during data export: {e}")
+
+    def get_fitter_state(self):
+        return {
+            'time_min_input': self.time_min_input.text(),
+            'time_max_input': self.time_max_input.text(),
+            'probe_min_input': self.probe_min_input.text(),
+            'probe_max_input': self.probe_max_input.text(),
+            'num_components_input': self.num_components_input.text(),
+            'T2_guess_input': self.T2_guess_input.text(),
+            'nu10_guess_input': self.nu10_guess_input.text(),
+            'nu21_guess_input': self.nu21_guess_input.text(),
+            'r_guess_input': self.r_guess_input.text(),
+            'interp_method': self.interp_method_combo.currentText(),
+            'num_interp_points': self.interp_points_input.value(),
+            'type': 'PFIDFitterApp', 'tab_title': self.objectName()
+        }
+
+    def set_fitter_state(self, state):
+        self.setObjectName(state.get('tab_title', 'PFID Fit'))
+        self.setWindowTitle(state.get('tab_title', 'PFID Fit'))
+
+        self.time_min_input.setText(state.get('time_min_input', "-15.0"))
+        self.time_max_input.setText(state.get('time_max_input', "-0.5"))
+        self.probe_min_input.setText(state.get('probe_min_input', "1775"))
+        self.probe_max_input.setText(state.get('probe_max_input', "1850"))
+
+        self.num_components_input.setText(state.get('num_components_input', "1"))
+        self.T2_guess_input.setText(state.get('T2_guess_input', "2.0"))
+        self.nu10_guess_input.setText(state.get('nu10_guess_input', "1810"))
+        self.nu21_guess_input.setText(state.get('nu21_guess_input', "1785"))
+        self.r_guess_input.setText(state.get('r_guess_input', "0.2"))
+        self.interp_method_combo.setCurrentText(state.get('interp_method', "cubic"))
+        self.interp_points_input.setValue(state.get('num_interp_points', 100))
+
+        self.results_data = None
+        self.results_text_edit.clear( )
+        QMessageBox.information(self, "State Loaded",
+                                "All PFID fit settings have been restored. Please click 'Run PFID Fit' to re-calculate and display the figures and report.")
+
 class GlobalFitApp(QWidget):
     def __init__(self, x_axis_data=None, y_axis_data=None, two_d_spectrum_data=None, parent=None,
                  x_axis_label='Probe wavenumber', y_axis_label='Time', x_axis_unit='cm\u207B\u00B9', y_axis_unit='ps',
@@ -250,6 +818,7 @@ class GlobalFitApp(QWidget):
         self.use_convolved_model_data = None
         self.initial_tau_guesses_data = None
         self.fit_report_string_data = ""
+        self.data_sliced_for_export = None
 
         self.das_interp_method = "None"
         self.das_interp_multiplier = 1
@@ -397,7 +966,7 @@ class GlobalFitApp(QWidget):
         self.fix_fwhm_checkbox.setEnabled(enabled)
 
     def export_fit_results(self):
-        if self.best_fit_data is None:
+        if self.best_fit_data is None or self.data_sliced_for_export is None:
             QMessageBox.warning(self, "No Data", "Please run the global fit analysis before exporting.")
             return
 
@@ -417,23 +986,26 @@ class GlobalFitApp(QWidget):
                 index = self.probe_data,
                 columns = [ f"τ = {tau:.2f}" for tau in self.best_taus_data ]
             )
-            das_df.to_csv(os.path.join(dir_name, f"{base_name}_DAS.csv"))
+            das_df.to_csv(os.path.join(dir_name, f"{base_name}_DAS.csv"), encoding = 'utf-8')
 
             fitted_data_df = pd.DataFrame(
                 self.best_fit_data,
                 index = self.time_data,
                 columns = self.probe_data
             )
-            fitted_data_df.to_csv(os.path.join(dir_name, f"{base_name}_2D_fitted_data.csv"))
+            fitted_data_df.to_csv(os.path.join(dir_name, f"{base_name}_2D_fitted_data.csv"), encoding = 'utf-8')
 
             traces_df = pd.DataFrame({
                 "Time": self.time_data,
             })
             for probe_val in self.probes_to_plot_data:
                 probe_idx = np.argmin(np.abs(self.probe_data - probe_val))
-                traces_df [ f"Trace at {probe_val}" ] = self.two_d_spectrum_data [ :, probe_idx ]
-                traces_df [ f"{probe_val}" ] = self.best_fit_data [ :, probe_idx ]
-            traces_df.to_csv(os.path.join(dir_name, f"{base_name}_time_traces.csv"))
+
+                traces_df [ f"Trace at {probe_val}" ] = self.data_sliced_for_export [ :, probe_idx ]
+
+                traces_df [ f"{probe_val} (Fit)" ] = self.best_fit_data [ :, probe_idx ]
+
+            traces_df.to_csv(os.path.join(dir_name, f"{base_name}_time_traces.csv"), encoding = 'utf-8')
 
             QMessageBox.information(
                 self, "Export Successful",
@@ -560,7 +1132,7 @@ class GlobalFitApp(QWidget):
         if not results:
             return
 
-        (best_fit, A_final, best_taus, r_squared, probe, time, data, probes_to_plot, best_t0,
+        (best_fit, A_final, best_taus, r_squared, probe, time, data_sliced, probes_to_plot, best_t0,
          best_fwhm, best_offset, use_convolved_model, initial_tau_guesses_for_print, fit_report_string,
          warnings) = results
 
@@ -570,6 +1142,7 @@ class GlobalFitApp(QWidget):
         self.r_squared_data = r_squared
         self.probe_data = probe
         self.time_data = time
+        self.data_sliced_for_export = data_sliced
         self.probes_to_plot_data = probes_to_plot
         self.best_t0_data = best_t0
         self.best_fwhm_data = best_fwhm
@@ -624,7 +1197,6 @@ class GlobalFitApp(QWidget):
             ax1.set_title(f'Fit data')
         ax1.set_xlabel(f'{self.x_axis_label} ({formatted_x_unit})')
         ax1.set_ylabel(f'{self.y_axis_label} ({formatted_y_unit})')
-        # fig1.colorbar(im1, ax = ax1, label = 'Signal (mOD)')
         fig1.tight_layout( )
         ax1.minorticks_on( )
         canvas1.draw( )
@@ -680,8 +1252,8 @@ class GlobalFitApp(QWidget):
 
         for p_val in probes_to_plot:
             idx = find(probe, p_val)
-            ax3.plot(time, data [ :, idx ], 'o', color = 'k', alpha = 0.2)
-            ax3.plot(time, best_fit [ :, idx ], '-', linewidth = 2, label = f'{p_val} {formatted_x_unit}')
+            ax3.plot(time, data_sliced [ :, idx ], '-', linewidth = 2, label = f'{p_val} {formatted_x_unit}')
+            ax3.plot(time, best_fit [ :, idx ], '-', linewidth = 1, color = 'k')
         ax3.set_title('Time Traces with Fits')
         ax3.set_xlabel(f'{self.y_axis_label} ({formatted_y_unit})')
         ax3.set_ylabel('Signal (mOD)')
@@ -879,6 +1451,8 @@ class ExponentialFitterApp(QWidget):
         self.params_text_edit.setStyleSheet("font-family: Consolas; font-size: 10pt;")
         self.start_guess_button = QPushButton("Start Initial Guess")
         self.fit_button = QPushButton("Fit Exponential")
+        self.export_button = QPushButton("Export Fit Data")
+        self.export_button.setDisabled(True)
         self.clear_button = QPushButton("Clear Guesses")
         self.close_button = QPushButton("Close Tab")
         self.info_label = QLabel("Use toolbar to zoom/pan. Click 'Start Initial Guess' to define components.")
@@ -890,6 +1464,7 @@ class ExponentialFitterApp(QWidget):
         self.control_layout = QHBoxLayout( )
         self.control_layout.addWidget(self.start_guess_button)
         self.control_layout.addWidget(self.fit_button)
+        self.control_layout.addWidget(self.export_button)
         self.control_layout.addWidget(self.clear_button)
         self.control_layout.addWidget(self.info_label)
         self.control_layout.addWidget(self.close_button)
@@ -899,6 +1474,7 @@ class ExponentialFitterApp(QWidget):
         self.main_layout.addWidget(self.splitter)
         self.start_guess_button.clicked.connect(self._toggle_guessing_mode)
         self.fit_button.clicked.connect(self.on_fit)
+        self.export_button.clicked.connect(self.export_fit_data)
         self.clear_button.clicked.connect(self.on_clear_guesses)
         self.close_button.clicked.connect(self._close_tab)
         self.canvas.mpl_connect('button_press_event', self.on_click)
@@ -956,15 +1532,58 @@ class ExponentialFitterApp(QWidget):
             self.display_fitted_parameters( )
             self.update_plot( )
             self.info_label.setText("Fitting complete. See fitted parameters below.")
+            self.export_button.setDisabled(False)
         except RuntimeError as e:
             QMessageBox.critical(self, "Fitting Error", f"Failed to fit: {e}. Adjust initial guesses and try again.")
             self.info_label.setText("Fitting failed. Adjust guesses.")
+            self.export_button.setDisabled(True)
 
     def on_clear_guesses(self):
         self.init_fitter_variables( )
         self.params_text_edit.clear( )
         self.info_label.setText("All guesses cleared. Click 'Start Initial Guess' to begin.")
+        self.export_button.setDisabled(True)
         self.update_plot( )
+
+    def export_fit_data(self):
+        if self.fitted_params is None:
+            QMessageBox.warning(self, "Export Error", "Please run a successful fit before exporting data.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Exponential Fit Data", "", "CSV Files (*.csv);;Text Files (*.txt)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            fit_y = multi_exponential(self.x_data, *self.fitted_params)
+
+            data_dict = {
+                self.xlabel: self.x_data,
+                f"Data ({self.ylabel})": self.y_data,
+                f"Fit Total ({self.ylabel})": fit_y
+            }
+
+            for i in range(0, len(self.fitted_params), 2):
+                amp, tau = self.fitted_params [ i:i + 2 ]
+                comp_y = exponential(self.x_data, amp, tau)
+                data_dict [ f"Component {i // 2 + 1} (tau={tau:.2g})" ] = comp_y
+
+            df = pd.DataFrame(data_dict)
+
+            report_lines = self.params_text_edit.toPlainText( ).split('\n')
+            comment_lines = [ f"# {line}" for line in report_lines if line.strip( ) ]
+
+            with open(file_path, 'w', encoding = 'utf-8') as f:
+                f.write('\n'.join(comment_lines) + '\n')
+                df.to_csv(f, index = False, lineterminator = '\n')
+
+            QMessageBox.information(self, "Export Successful", f"Fit data exported to:\n{file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"An error occurred during data export: {e}")
 
     def display_fitted_parameters(self):
         if self.fitted_params is None:
@@ -1035,6 +1654,9 @@ class ExponentialFitterApp(QWidget):
         self.fixed_components = state.get('fixed_components', [ ])
         self.fitted_params = np.array(state.get('fitted_params')) if state.get('fitted_params') is not None else None
         self.fitted_errors = np.array(state.get('fitted_errors')) if state.get('fitted_errors') is not None else None
+
+        self.export_button.setDisabled(self.fitted_params is None)
+
         self.display_fitted_parameters( )
         self.update_plot( )
 
@@ -1084,6 +1706,8 @@ class GaussianFitterApp(QWidget):
         self.params_text_edit.setStyleSheet("font-family: Consolas; font-size: 10pt;")
         self.start_guess_button = QPushButton("Start Initial Guess")
         self.fit_button = QPushButton(f"Fit {self.fitting_function_type}")
+        self.export_button = QPushButton("Export Fit Data")
+        self.export_button.setDisabled(True)
         self.clear_button = QPushButton("Clear Guesses")
         self.close_button = QPushButton("Close Tab")
         self.info_label = QLabel(
@@ -1096,6 +1720,7 @@ class GaussianFitterApp(QWidget):
         self.control_layout = QHBoxLayout( )
         self.control_layout.addWidget(self.start_guess_button)
         self.control_layout.addWidget(self.fit_button)
+        self.control_layout.addWidget(self.export_button)
         self.control_layout.addWidget(self.clear_button)
         self.control_layout.addWidget(self.info_label)
         self.control_layout.addWidget(self.close_button)
@@ -1105,6 +1730,7 @@ class GaussianFitterApp(QWidget):
         self.main_layout.addWidget(self.splitter)
         self.start_guess_button.clicked.connect(self._toggle_guessing_mode)
         self.fit_button.clicked.connect(self.on_fit)
+        self.export_button.clicked.connect(self.export_fit_data)
         self.clear_button.clicked.connect(self.on_clear_guesses)
         self.close_button.clicked.connect(self._close_tab)
         self.canvas.mpl_connect('button_press_event', self.on_click)
@@ -1245,14 +1871,17 @@ class GaussianFitterApp(QWidget):
             self.update_plot( )
             self.display_fitted_parameters( )
             self.info_label.setText("Fitting complete. See fitted parameters below.")
+            self.export_button.setDisabled(False)
         except RuntimeError as e:
             QMessageBox.critical(self, "Fitting Error",
                                  f"Failed to fit {self.fitting_function_type}: {e}. Adjust peaks and try again.")
             self.info_label.setText("Fitting failed. Adjust guesses and try again.")
+            self.export_button.setDisabled(True)
         except ValueError as e:
             QMessageBox.critical(self, "Fitting Error",
                                  f"Fitting input error: {e}. Check data and initial parameters.")
             self.info_label.setText("Fitting failed due to input error. Check data.")
+            self.export_button.setDisabled(True)
 
     def on_clear_guesses(self):
         self.fixed_peaks = [ ]
@@ -1264,7 +1893,56 @@ class GaussianFitterApp(QWidget):
         self.fitted_errors = None
         self.params_text_edit.clear( )
         self.info_label.setText("All peak guesses cleared. Click 'Start Initial Guess' to define new ones.")
+        self.export_button.setDisabled(True)
         self.update_plot( )
+
+    def export_fit_data(self):
+        if self.fitted_params is None:
+            QMessageBox.warning(self, "Export Error", "Please run a successful fit before exporting data.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, f"Save {self.fitting_function_type} Fit Data", "", "CSV Files (*.csv);;Text Files (*.txt)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            multi_func = self._get_multi_function( )
+            single_func = self._get_single_function( )
+            fit_y = multi_func(self.xga, *self.fitted_params)
+
+            data_dict = {
+                self.xlabel: self.xga,
+                f"Data ({self.ylabel})": self.yga,
+                f"Fit Total ({self.ylabel})": fit_y
+            }
+
+            for i in range(0, len(self.fitted_params), 3):
+                amp, pos, fwhm = self.fitted_params [ i:i + 3 ]
+                comp_y = single_func(self.xga, amp, pos, fwhm)
+
+                if self.fitting_function_type == "Gaussian":
+                    name = f"Component {i // 3 + 1} (Pos={pos:.2f}, FWHM={fwhm:.2f})"
+                else:
+                    name = f"Component {i // 3 + 1} (Mean={pos:.2f}, FWHM={fwhm:.2f})"
+
+                data_dict [ name ] = comp_y
+
+            df = pd.DataFrame(data_dict)
+
+            report_lines = self.params_text_edit.toPlainText( ).split('\n')
+            comment_lines = [ f"# {line}" for line in report_lines if line.strip( ) ]
+
+            with open(file_path, 'w', encoding = 'utf-8') as f:
+                f.write('\n'.join(comment_lines) + '\n')
+                df.to_csv(f, index = False, lineterminator = '\n')
+
+            QMessageBox.information(self, "Export Successful", f"Fit data exported to:\n{file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"An error occurred during data export: {e}")
 
     def display_fitted_parameters(self):
         if self.fitted_params is None:
@@ -1363,6 +2041,9 @@ class GaussianFitterApp(QWidget):
         self.fitted_params = np.array(state.get('fitted_params')) if state.get('fitted_params') is not None else None
         self.fitted_errors = np.array(state.get('fitted_errors')) if state.get('fitted_errors') is not None else None
         self.is_spline_corrected = state.get('is_spline_corrected', False)
+
+        self.export_button.setDisabled(self.fitted_params is None)
+
         self.display_fitted_parameters( )
         self.update_plot( )
 
@@ -1809,7 +2490,7 @@ class SignalPlotterApp(QMainWindow):
         self.y_slider.setTickPosition(QSlider.TicksBelow)
         self.y_slider.valueChanged.connect(self.update_plots)
         self.min_level_input = QLineEdit(self)
-        self.min_level_input.setPlaceholderText("-0.1")
+        self.min_level_input.setPlaceholderText("-0.5")
         self.min_level_input.setFont(label_font)
         self.min_level_input.setValidator(QDoubleValidator( ))
         self.min_level_input.editingFinished.connect(self.update_plots)
@@ -1859,6 +2540,11 @@ class SignalPlotterApp(QMainWindow):
         self.global_fit_button.setMinimumHeight(30)
         self.global_fit_button.clicked.connect(self._launch_global_fit_tab)
 
+        self.pfid_fit_button = QPushButton("Open PFID Fit Tab")
+        self.pfid_fit_button.setFont(label_font)
+        self.pfid_fit_button.setMinimumHeight(30)
+        self.pfid_fit_button.clicked.connect(self._launch_pfid_fit_tab)
+
         self.main_plot_tab_layout.addWidget(self.signal_plot_widget, 0, 0, 2, 2)
         x_slice_controls_layout = QHBoxLayout( )
         x_slice_controls_layout.addWidget(self.x_hold_button)
@@ -1904,6 +2590,7 @@ class SignalPlotterApp(QMainWindow):
         level_inputs_layout.addWidget(self.max_level_input)
         level_inputs_layout.addStretch(1)
         level_inputs_layout.addWidget(self.global_fit_button)
+        level_inputs_layout.addWidget(self.pfid_fit_button)
         level_inputs_layout.addSpacing(5)
         level_inputs_layout.addWidget(self.spline_baseline_button)
         level_inputs_layout.addWidget(self.interp_method_label)
@@ -1966,6 +2653,29 @@ class SignalPlotterApp(QMainWindow):
         self.tab_widget.setCurrentIndex(tab_index)
         self.active_fitter_tabs.append({ 'widget': global_fit_tab, 'tab_index': tab_index })
         global_fit_tab.destroyed.connect(partial(self._remove_fitter_tab, global_fit_tab))
+        self._set_data_modified( )
+
+    def _launch_pfid_fit_tab(self):
+        if not self.data_loaded or self.current_signal_data is None:
+            QMessageBox.warning(self, "No Data", "Please import a dataset before running the PFID fit.")
+            return
+
+        x_axis_label, x_axis_unit = _parse_label_and_unit(self.axis_labels [ 'signal_bottom' ])
+        y_axis_label, y_axis_unit = _parse_label_and_unit(self.axis_labels [ 'signal_left' ])
+
+        pfid_fit_tab = PFIDFitterApp(
+            main_window = self,
+            x_axis_label = x_axis_label,
+            y_axis_label = y_axis_label,
+            x_axis_unit = x_axis_unit,
+            y_axis_unit = y_axis_unit,
+            font_size = self.axis_label_font_size
+        )
+
+        tab_index = self.tab_widget.addTab(pfid_fit_tab, "PFID Fit")
+        self.tab_widget.setCurrentIndex(tab_index)
+        self.active_fitter_tabs.append({ 'widget': pfid_fit_tab, 'tab_index': tab_index })
+        pfid_fit_tab.destroyed.connect(partial(self._remove_fitter_tab, pfid_fit_tab))
         self._set_data_modified( )
 
     def _get_interpolated_1d_data(self, original_x, original_y, method, multiplier):
@@ -2039,7 +2749,7 @@ class SignalPlotterApp(QMainWindow):
             if plot_widget == self.x_slice_plot_widget:
                 current_pen = self.x_slice_curve.opts [ 'pen' ]
                 self.x_slice_curve.setPen(
-                    pg.mkPen(current_pen.color( ), width = new_thickness, style = current_pen.style( )))
+                    pg.mkPen(current_pen.color( ), width = new_thickness, style = Qt.SolidLine))
             elif plot_widget == self.y_slice_plot_widget:
                 current_pen = self.y_slice_curve.opts [ 'pen' ]
                 self.y_slice_curve.setPen(
@@ -2093,6 +2803,7 @@ class SignalPlotterApp(QMainWindow):
             self.interp_method_combo.setEnabled(False)
             self.interp_multiplier_combo.setEnabled(False)
             self.global_fit_button.setEnabled(False)
+            self.pfid_fit_button.setEnabled(False)
             return
         self.x_slider.setEnabled(True)
         self.y_slider.setEnabled(True)
@@ -2113,6 +2824,7 @@ class SignalPlotterApp(QMainWindow):
         self.interp_method_combo.setEnabled(True)
         self.interp_multiplier_combo.setEnabled(True)
         self.global_fit_button.setEnabled(True)
+        self.pfid_fit_button.setEnabled(True)
         x_idx_raw = self.x_slider.value( )
         y_idx_raw = self.y_slider.value( )
         x_pos_val_raw = self.current_x_values [ x_idx_raw ]
@@ -2212,7 +2924,6 @@ class SignalPlotterApp(QMainWindow):
 
     def _format_unit_for_display(self, unit_string):
         unit_string = unit_string.replace("^-1", "\u207B\u00B9")
-        unit_string = unit_string.replace("^-2", "\u207B\u00B2")
         unit_string = unit_string.replace("^2", "\u00B2")
         unit_string = unit_string.replace("^3", "\u00B3")
         unit_string = unit_string.replace("^-3", "\u207B\u00B3")
@@ -2714,6 +3425,9 @@ class SignalPlotterApp(QMainWindow):
                     new_widget = GaussianFitterApp(parent = self)
                 elif widget_type == 'ExponentialFitterApp':
                     new_widget = ExponentialFitterApp(parent = self)
+                elif widget_type == 'PFIDFitterApp':
+                    new_widget = PFIDFitterApp(main_window = self)
+
                 if new_widget:
                     if hasattr(new_widget, 'set_fitter_state'):
                         new_widget.set_fitter_state(state)
