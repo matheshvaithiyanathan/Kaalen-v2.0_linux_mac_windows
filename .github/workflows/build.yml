@@ -12,41 +12,80 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # FIX 1: Using the currently supported LTS runner for Linux stability
-        os: [windows-latest, macos-latest, ubuntu-22.04] 
+        # Using ubuntu-latest as the host runner, but the build environment is Docker (see below)
+        os: [windows-latest, macos-latest, ubuntu-latest] 
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ----------------------------------------------------------------------
+      # Linux Build Step: Use Docker to manage GLIBC/compatibility
+      # ----------------------------------------------------------------------
+      - name: Build Linux Binary (in Docker Container for Compatibility)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: docker://ubuntu:20.04
+        with:
+          args: /bin/bash -c "
+            # 1. Install dependencies
+            apt-get update && apt-get install -y python3 python3-pip zip wget;
+            pip install pyinstaller -r requirements.txt;
+            
+            # 2. Run PyInstaller
+            pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0;
+            
+            # 3. Create Artifact Directory Structure and Move Binary
+            mkdir -p ${{ github.workspace }}/build/linux;
+            cp dist/Kaalen-v1.0 ${{ github.workspace }}/build/linux/;
+            
+            # 4. FIX: Ensure executable permission is set
+            chmod +x ${{ github.workspace }}/build/linux/Kaalen-v1.0;
+            
+            # 5. FIX: CREATE THE .desktop FILE for double-clicking
+            echo '[Desktop Entry]' > ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Name=Kaalen Spectroscopy App' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Comment=2D Spectroscopy Data Analysis Tool' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            # Exec uses relative path since the .desktop is in the same folder as the binary after unzipping
+            echo 'Exec=./Kaalen-v1.0' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Icon=icon.ico' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop; # Assumes icon.ico is also included in the zip
+            echo 'Terminal=false' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Type=Application' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            
+            # 6. Include the icon file for the desktop entry
+            cp icon.ico ${{ github.workspace }}/build/linux/icon.ico;
+            "
+        env: 
+          LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6 # Helps with GUI apps in containers
+
+      # ----------------------------------------------------------------------
+      # Steps for Windows/macOS Build: (Same as before)
+      # ----------------------------------------------------------------------
+      - name: Set up Python (Windows/macOS)
+        if: ${{ matrix.os != 'ubuntu-latest' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install PyInstaller and dependencies
+          
+      - name: Install PyInstaller and dependencies (Windows/macOS)
+        if: ${{ matrix.os != 'ubuntu-latest' }}
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install -r requirements.txt
       
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (Windows/macOS)
+        if: ${{ matrix.os != 'ubuntu-latest' }}
         run: |
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
             pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0 --icon icon.ico
           elif [ "${{ matrix.os }}" == "macos-latest" ]; then
             pyinstaller App_PP.py --windowed --onefile --distpath build/macos --name Kaalen-v1.0 --icon icon.ico
-          elif [ "${{ matrix.os }}" == "ubuntu-22.04" ]; then # Updated condition
-            pyinstaller App_PP.py --onefile --distpath build/linux --name Kaalen-v1.0
-            # FIX 2: Explicitly set executable permission for Linux binary 
-            chmod +x build/linux/Kaalen-v1.0
           fi
         shell: bash
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          # The name must match the matrix OS tag
           name: Kaalen-${{ matrix.os }}
           path: build/*
           retention-days: 7
@@ -75,8 +114,8 @@ jobs:
 
       - name: Zip Linux artifact
         run: |
-          # FIX 3: Update artifact directory name to match the new runner name
-          cd artifacts/Kaalen-ubuntu-22.04 
+          # The binary, icon, and the .desktop file are all inside this artifact folder
+          cd artifacts/Kaalen-ubuntu-latest 
           zip -r ../../Kaalen-linux.zip .
 
       - name: Create Release
@@ -93,6 +132,6 @@ jobs:
             
             This release includes standalone executables for Windows, macOS, and Linux.
             
-            **Linux users:** Please run the executable from the terminal using `./Kaalen-v1.0` after unzipping.
+            **Linux users:** After unzipping, you can double-click the **Kaalen-v1.0.desktop** file to launch the application.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
