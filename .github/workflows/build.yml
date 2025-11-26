@@ -1,141 +1,76 @@
-name: Build and Package App with PyInstaller
+# .github/workflows/build.yml
+
+name: Create Windows Installer
 
 on:
+  # Triggers the workflow on push to the main branch
   push:
-    branches:
-      - main
-      - develop
+    branches: [ main ]
+  # Allows manual triggering from the GitHub Actions tab
   workflow_dispatch:
 
 jobs:
-  build-binaries:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+  build_executable:
+    name: 1. Build PyInstaller Executable
+    runs-on: windows-latest
+    
+    steps:
+    - name: ⬇️ Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' 
+
+    - name: 📦 Install Python Dependencies
+      # Install packages in a specific order known to minimize PyQt/SciPy issues
+      run: |
+        python -m pip install --upgrade pip
+        # Pinning PyInstaller to known stable version and installing all dependencies
+        pip install pyinstaller==6.2.0 -r requirements.txt
+        Write-Host "Dependencies installed successfully."
+
+    - name: 🔧 Generate Executable (PyInstaller) - Force Build
+      run: |
+        Remove-Item -Path "build", "dist" -Recurse -ErrorAction SilentlyContinue
+        # Use the now committed Kaalen_App.spec file
+        python -m PyInstaller -y --clean Kaalen_App.spec
+        
+        if (-not (Test-Path -Path "dist\Kaalen_App")) {
+            throw "PyInstaller failed to create the 'dist\Kaalen_App' bundle. Check detailed logs above for collection errors."
+        }
+    
+    - name: ⬆️ Upload Executable as Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kaalen-pyinstaller-bundle
+        path: dist/Kaalen_App/ 
+        retention-days: 1
+
+  build_installer:
+    name: 2. Compile Final Installer
+    runs-on: windows-latest
+    needs: [build_executable]
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    - name: ⬇️ Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: ⬇️ Download Executable Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: kaalen-pyinstaller-bundle
+        path: dist/Kaalen_App/ 
+        
+    - name: ⚙️ Install Inno Setup Compiler
+      run: choco install innosetup --no-progress
 
-      # ----------------------------------------------------------------------
-      # LINUX BUILD (using Docker)
-      # ----------------------------------------------------------------------
-      - name: Build Linux Binary inside Docker (Fixing backports dependency)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          # Consolidating the Docker run command to avoid line continuation issues
-          docker run --rm -v "${{ github.workspace }}:/src" ubuntu:20.04 /bin/bash -c "
-              set -e
+    - name: 💾 Compile Installer (Inno Setup)
+      run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "Kaalen_Installer.iss"'
 
-              cd /src
-
-              # Added 'build-essential' for compiling Python packages
-              apt-get update && apt-get install -y python3 python3-pip zip build-essential
-
-              pip3 install pyinstaller
-              # FIX: Explicitly install backports.zoneinfo to resolve ModuleNotFoundError: No module named 'backports' 
-              pip3 install backports.zoneinfo
-              pip3 install -r requirements.txt
-
-              pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
-
-              mkdir -p build/linux
-              cp dist/Kaalen-v1.0 build/linux/
-              chmod +x build/linux/Kaalen-v1.0
-
-              # Creating .desktop launcher using the fault-tolerant echo command
-              echo -e '[Desktop Entry]\nName=Kaalen Spectroscopy App\nComment=2D Spectroscopy Data Analysis Tool\nExec=./Kaalen-v1.0\nIcon=icon.ico\nTerminal=false\nType=Application' > build/linux/Kaalen-v1.0.desktop
-              
-              cp icon.ico build/linux/
-            "
-
-      # ----------------------------------------------------------------------
-      # WINDOWS / MACOS BUILD
-      # ----------------------------------------------------------------------
-      - name: Set up Python (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
-        run: |
-          pip install --upgrade pip
-          pip install pyinstaller
-          # Adding backports.zoneinfo here as well, just in case the same issue arises on Windows/macOS runners
-          pip install backports.zoneinfo
-          pip install -r requirements.txt
-
-      - name: Build Executable (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
-        shell: bash
-        run: |
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0.exe --icon icon.ico
-          elif [ "${{ matrix.os }}" == "macos-latest" ]; then
-            pyinstaller App_PP.py --windowed --onefile --distpath build/macos --name Kaalen-v1.0 --icon icon.ico
-          fi
-
-      # ----------------------------------------------------------------------
-      # UPLOAD ARTIFACTS
-      # ----------------------------------------------------------------------
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Kaalen-${{ matrix.os }}
-          path: build/*
-          retention-days: 7
-
-  # ------------------------------------------------------------------------
-  # CREATE RELEASE
-  # ------------------------------------------------------------------------
-  create-release:
-    needs: build-binaries
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Zip Windows artifact
-        run: |
-          cd artifacts/Kaalen-windows-latest
-          zip -r ../../Kaalen-windows.zip windows/*
-
-      - name: Zip macOS artifact
-        run: |
-          cd artifacts/Kaalen-macos-latest
-          zip -r ../../Kaalen-macos.zip macos/*
-
-      - name: Zip Linux artifact
-        run: |
-          cd artifacts/Kaalen-ubuntu-latest
-          zip -r ../../Kaalen-linux.zip linux/*
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            Kaalen-windows.zip
-            Kaalen-macos.zip
-            Kaalen-linux.zip
-          name: Release ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}-${{ github.run_number }}
-          body: |
-            Automated cross-platform release.
-
-            Includes standalone executables for:
-            • Windows  
-            • macOS  
-            • Linux  
-
-            Linux users:
-            After unzipping, double-click **Kaalen-v1.0.desktop** to launch.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: 🚀 Upload Installer to Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Kaalen-Windows-Installer
+        path: Output_Installer\Kaalen_Setup_v1.0.exe
