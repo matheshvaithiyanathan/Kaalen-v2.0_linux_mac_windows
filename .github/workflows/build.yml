@@ -24,27 +24,17 @@ jobs:
       - name: Build Linux Binary inside Docker
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
-          # Putting the Docker run command on one logical line to prevent YAML parsing errors on line continuation characters (\)
           docker run --rm -v "${{ github.workspace }}:/src" ubuntu:20.04 /bin/bash -c "
-              set -e # Exit immediately if a command exits with a non-zero status.
-
-              cd /src
-
-              # FIX: Added 'build-essential' for compiling Python packages (e.g., NumPy/SciPy) from requirements.txt.
-              apt-get update && apt-get install -y python3 python3-pip zip build-essential
-
-              pip3 install pyinstaller
-              pip3 install -r requirements.txt
-
-              # Added --icon flag for consistency with other platforms. 
-              pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
-
-              mkdir -p build/linux
-              cp dist/Kaalen-v1.0 build/linux/
-              chmod +x build/linux/Kaalen-v1.0
-
-              # .desktop launcher - The content itself is correct.
-              cat << EOF > build/linux/Kaalen-v1.0.desktop
+          set -e
+          cd /src
+          apt-get update && apt-get install -y python3 python3-pip zip build-essential
+          pip3 install pyinstaller
+          pip3 install -r requirements.txt
+          pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
+          mkdir -p build/linux
+          cp dist/Kaalen-v1.0 build/linux/
+          chmod +x build/linux/Kaalen-v1.0
+          cat << 'EOF' > build/linux/Kaalen-v1.0.desktop
 [Desktop Entry]
 Name=Kaalen Spectroscopy App
 Comment=2D Spectroscopy Data Analysis Tool
@@ -53,9 +43,8 @@ Icon=icon.ico
 Terminal=false
 Type=Application
 EOF
-              # The icon.ico file is copied below for the .desktop launcher to reference
-              cp icon.ico build/linux/
-            "
+          cp icon.ico build/linux/
+          "
 
       # ----------------------------------------------------------------------
       # WINDOWS / MACOS BUILD
