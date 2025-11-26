@@ -12,7 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # We still define the OS, but use the DOCKER IMAGE for the Linux build
+        # Use ubuntu-latest as the host runner, but build Linux inside a Docker container
         os: [windows-latest, macos-latest, ubuntu-latest] 
     
     steps:
@@ -20,29 +20,47 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------------------
-      # Step for Linux Build: Uses a Docker container with an old GLIBC
+      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and resolves YAML syntax error
       # ----------------------------------------------------------------------
-      - name: Build Linux Binary (in Docker Container for Compatibility)
+      - name: Build Linux Binary (in Docker Container for Wide Compatibility)
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        # Use an older Ubuntu Docker image (like 20.04) known for wider GLIBC compatibility.
+        # Use docker://ubuntu:20.04 for the build environment (older GLIBC)
         uses: docker://ubuntu:20.04
         with:
-          args: /bin/bash -c "
-            apt-get update && apt-get install -y python3 python3-pip zip;
+          # FIX: Using the Literal Block Scalar (|) resolves YAML syntax errors in multiline args
+          args: |
+            /bin/bash -c "
+            # 1. Install dependencies
+            apt-get update && apt-get install -y python3 python3-pip zip wget;
             pip install pyinstaller -r requirements.txt;
-            # Run pyinstaller
-            pyinstaller App_PP.py --onefile --distpath build/linux --name Kaalen-v1.0;
-            # Fix permission and create artifact directory structure
+            
+            # 2. Run PyInstaller
+            pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0;
+            
+            # 3. Create Artifact Directory Structure and Move Binary
             mkdir -p ${{ github.workspace }}/build/linux;
             cp dist/Kaalen-v1.0 ${{ github.workspace }}/build/linux/;
+            
+            # 4. FIX: Ensure executable permission is set
             chmod +x ${{ github.workspace }}/build/linux/Kaalen-v1.0;
+            
+            # 5. FIX: CREATE THE .desktop FILE for double-clicking
+            echo '[Desktop Entry]' > ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Name=Kaalen Spectroscopy App' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Comment=2D Spectroscopy Data Analysis Tool' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Exec=./Kaalen-v1.0' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Icon=icon.ico' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop; 
+            echo 'Terminal=false' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            echo 'Type=Application' >> ${{ github.workspace }}/build/linux/Kaalen-v1.0.desktop;
+            
+            # 6. Include the icon file
+            cp icon.ico ${{ github.workspace }}/build/linux/icon.ico;
             "
         env: 
-          # Environment variable needed for GUI apps in container builds
           LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6
 
       # ----------------------------------------------------------------------
-      # Steps for Windows/macOS Build: Standard runner execution
+      # WINDOWS / MACOS BUILD STEPS
       # ----------------------------------------------------------------------
       - name: Set up Python (Windows/macOS)
         if: ${{ matrix.os != 'ubuntu-latest' }}
@@ -85,9 +103,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      
-      # The artifact names include the original runner label (ubuntu-latest)
-      
+
       - name: Zip Windows artifact
         run: |
           cd artifacts/Kaalen-windows-latest
@@ -100,7 +116,7 @@ jobs:
 
       - name: Zip Linux artifact
         run: |
-          cd artifacts/Kaalen-ubuntu-latest # This name matches the matrix.os value
+          cd artifacts/Kaalen-ubuntu-latest 
           zip -r ../../Kaalen-linux.zip .
 
       - name: Create Release
@@ -117,6 +133,6 @@ jobs:
             
             This release includes standalone executables for Windows, macOS, and Linux.
             
-            **Linux users:** Please run the executable from the terminal using `./Kaalen-v1.0` after unzipping.
+            **Linux users:** After unzipping, double-click the **Kaalen-v1.0.desktop** file to launch the application.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
