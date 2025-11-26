@@ -12,21 +12,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # Use ubuntu-latest as the host runner for all jobs, relying on Docker for the Linux build environment
+        # Use ubuntu-latest as the host runner for all jobs
         os: [windows-latest, macos-latest, ubuntu-latest] 
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      ---
-      
       # ----------------------------------------------------------------------
-      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and fixes file paths
+      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and resolves YAML errors
       # ----------------------------------------------------------------------
       - name: Build Linux Binary (in Docker Container for Wide Compatibility)
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        # Uses ubuntu:20.04 to prevent GLIBC_2.38 dependency errors on older user systems
+        # Uses docker://ubuntu:20.04 to prevent GLIBC_2.38 dependency errors on older user systems
         uses: docker://ubuntu:20.04
         with:
           # Using the Literal Block Scalar (|) for clean multiline commands
@@ -37,7 +35,6 @@ jobs:
             pip install pyinstaller -r requirements.txt;
             
             # 2. Run PyInstaller, outputting directly to the final host path
-            # FIX: This ensures the build/linux folder exists and contains files for artifact upload
             pyinstaller App_PP.py --onefile --distpath ${{ github.workspace }}/build/linux --name Kaalen-v1.0;
             
             # 3. Define variables for clarity
@@ -59,9 +56,7 @@ jobs:
             cp icon.ico ${{ github.workspace }}/build/linux/icon.ico;
             "
         env: 
-          LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6 # Essential for PyQt/Matplotlib GUI apps in containers
-
-      ---
+          LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6
 
       # ----------------------------------------------------------------------
       # WINDOWS / MACOS BUILD STEPS (Standard runner execution)
@@ -93,12 +88,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Kaalen-${{ matrix.os }}
-          # This path now correctly covers build/windows, build/macos, and build/linux
           path: build/*
           retention-days: 7
 
-  ---
-  
   create-release:
     needs: build-binaries
     runs-on: ubuntu-latest
@@ -124,7 +116,6 @@ jobs:
       - name: Zip Linux artifact
         run: |
           cd artifacts/Kaalen-ubuntu-latest 
-          # This zip contains the binary, icon, and .desktop file from the build/linux folder
           zip -r ../../Kaalen-linux.zip .
 
       - name: Create Release
