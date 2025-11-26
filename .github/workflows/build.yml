@@ -24,27 +24,30 @@ jobs:
       - name: Build Linux Binary inside Docker
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
+          # Consolidating the Docker run command to avoid line continuation issues
           docker run --rm -v "${{ github.workspace }}:/src" ubuntu:20.04 /bin/bash -c "
-          set -e
-          cd /src
-          apt-get update && apt-get install -y python3 python3-pip zip build-essential
-          pip3 install pyinstaller
-          pip3 install -r requirements.txt
-          pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
-          mkdir -p build/linux
-          cp dist/Kaalen-v1.0 build/linux/
-          chmod +x build/linux/Kaalen-v1.0
-          cat << 'EOF' > build/linux/Kaalen-v1.0.desktop
-[Desktop Entry]
-Name=Kaalen Spectroscopy App
-Comment=2D Spectroscopy Data Analysis Tool
-Exec=./Kaalen-v1.0
-Icon=icon.ico
-Terminal=false
-Type=Application
-EOF
-          cp icon.ico build/linux/
-          "
+              set -e
+
+              cd /src
+
+              # Added 'build-essential' for compiling Python packages
+              apt-get update && apt-get install -y python3 python3-pip zip build-essential
+
+              pip3 install pyinstaller
+              pip3 install -r requirements.txt
+
+              pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
+
+              mkdir -p build/linux
+              cp dist/Kaalen-v1.0 build/linux/
+              chmod +x build/linux/Kaalen-v1.0
+
+              # FIX for line 53: Switched from multi-line 'cat << EOF' to a single-line 'echo' command. 
+              # This bypasses the YAML parser's issue with the complex nested structure.
+              echo -e '[Desktop Entry]\nName=Kaalen Spectroscopy App\nComment=2D Spectroscopy Data Analysis Tool\nExec=./Kaalen-v1.0\nIcon=icon.ico\nTerminal=false\nType=Application' > build/linux/Kaalen-v1.0.desktop
+              
+              cp icon.ico build/linux/
+            "
 
       # ----------------------------------------------------------------------
       # WINDOWS / MACOS BUILD
@@ -66,12 +69,9 @@ EOF
         if: ${{ matrix.os != 'ubuntu-latest' }}
         shell: bash
         run: |
-          # We define the platform-specific output path here to be consistent with the Linux step.
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            # Windows: --noconsole and --icon are appropriate
             pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0.exe --icon icon.ico
           elif [ "${{ matrix.os }}" == "macos-latest" ]; then
-            # macOS: --windowed and --icon are appropriate
             pyinstaller App_PP.py --windowed --onefile --distpath build/macos --name Kaalen-v1.0 --icon icon.ico
           fi
 
@@ -102,7 +102,6 @@ EOF
 
       - name: Zip Windows artifact
         run: |
-          # Pathing for zip is confirmed to be correct for action-download-artifact@v4
           cd artifacts/Kaalen-windows-latest
           zip -r ../../Kaalen-windows.zip windows/*
 
