@@ -20,11 +20,11 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------------------
-      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and resolves YAML errors
+      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and ensures file paths are correct
       # ----------------------------------------------------------------------
       - name: Build Linux Binary (in Docker Container for Wide Compatibility)
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        # Uses docker://ubuntu:20.04 to prevent GLIBC_2.38 dependency errors on older user systems
+        # Uses docker://ubuntu:20.04 to prevent GLIBC_2.38 dependency errors
         uses: docker://ubuntu:20.04
         with:
           # Using the Literal Block Scalar (|) for clean multiline commands
@@ -59,7 +59,7 @@ jobs:
           LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6
 
       # ----------------------------------------------------------------------
-      # WINDOWS / MACOS BUILD STEPS (Standard runner execution)
+      # WINDOWS / MACOS BUILD STEPS
       # ----------------------------------------------------------------------
       - name: Set up Python (Windows/macOS)
         if: ${{ matrix.os != 'ubuntu-latest' }}
