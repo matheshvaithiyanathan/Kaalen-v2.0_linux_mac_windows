@@ -13,71 +13,32 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------------------
-      # LINUX BUILD (using Docker)
-      # ----------------------------------------------------------------------
-      - name: Build Linux Binary inside Docker
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          # Consolidating the Docker run command to avoid line continuation issues
-          docker run --rm -v "${{ github.workspace }}:/src" ubuntu:20.04 /bin/bash -c "
-              set -e
-
-              cd /src
-
-              # Added 'build-essential' for compiling Python packages
-              apt-get update && apt-get install -y python3 python3-pip zip build-essential
-
-              pip3 install pyinstaller
-              pip3 install -r requirements.txt
-
-              pyinstaller App_PP.py --onefile --distpath dist --name Kaalen-v1.0 --icon icon.ico
-
-              mkdir -p build/linux
-              cp dist/Kaalen-v1.0 build/linux/
-              chmod +x build/linux/Kaalen-v1.0
-
-              # FIX for line 53: Switched from multi-line 'cat << EOF' to a single-line 'echo' command. 
-              # This bypasses the YAML parser's issue with the complex nested structure.
-              echo -e '[Desktop Entry]\nName=Kaalen Spectroscopy App\nComment=2D Spectroscopy Data Analysis Tool\nExec=./Kaalen-v1.0\nIcon=icon.ico\nTerminal=false\nType=Application' > build/linux/Kaalen-v1.0.desktop
-              
-              cp icon.ico build/linux/
-            "
-
-      # ----------------------------------------------------------------------
-      # WINDOWS / MACOS BUILD
-      # ----------------------------------------------------------------------
-      - name: Set up Python (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install pyinstaller
           pip install -r requirements.txt
-
-      - name: Build Executable (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
-        shell: bash
+      
+      - name: Build with PyInstaller
         run: |
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0.exe --icon icon.ico
+            pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0 --icon icon.ico
           elif [ "${{ matrix.os }}" == "macos-latest" ]; then
             pyinstaller App_PP.py --windowed --onefile --distpath build/macos --name Kaalen-v1.0 --icon icon.ico
+          elif [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+            pyinstaller App_PP.py --onefile --distpath build/linux --name Kaalen-v1.0
           fi
+        shell: bash
 
-      # ----------------------------------------------------------------------
-      # UPLOAD ARTIFACTS
-      # ----------------------------------------------------------------------
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -85,15 +46,11 @@ jobs:
           path: build/*
           retention-days: 7
 
-  # ------------------------------------------------------------------------
-  # CREATE RELEASE
-  # ------------------------------------------------------------------------
   create-release:
     needs: build-binaries
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -103,17 +60,17 @@ jobs:
       - name: Zip Windows artifact
         run: |
           cd artifacts/Kaalen-windows-latest
-          zip -r ../../Kaalen-windows.zip windows/*
+          zip -r ../../Kaalen-windows.zip .
 
       - name: Zip macOS artifact
         run: |
           cd artifacts/Kaalen-macos-latest
-          zip -r ../../Kaalen-macos.zip macos/*
+          zip -r ../../Kaalen-macos.zip .
 
       - name: Zip Linux artifact
         run: |
           cd artifacts/Kaalen-ubuntu-latest
-          zip -r ../../Kaalen-linux.zip linux/*
+          zip -r ../../Kaalen-linux.zip .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -125,14 +82,8 @@ jobs:
           name: Release ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}-${{ github.run_number }}
           body: |
-            Automated cross-platform release.
-
-            Includes standalone executables for:
-            • Windows  
-            • macOS  
-            • Linux  
-
-            Linux users:
-            After unzipping, double-click **Kaalen-v1.0.desktop** to launch.
+            This is an automated release.
+            
+            This release includes standalone executables for Windows, macOS, and Linux.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
