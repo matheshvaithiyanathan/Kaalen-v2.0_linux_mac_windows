@@ -12,75 +12,43 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # Use ubuntu-latest as the host runner for all jobs
-        os: [windows-latest, macos-latest, ubuntu-latest] 
+        # Use ubuntu-22.04 as the target runner for Linux builds
+        os: [windows-latest, macos-latest, ubuntu-22.04] 
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------------------
-      # LINUX BUILD STEP: Uses Docker for GLIBC compatibility and ensures file paths are correct
-      # ----------------------------------------------------------------------
-      - name: Build Linux Binary (in Docker Container for Wide Compatibility)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        # Uses docker://ubuntu:20.04 to prevent GLIBC_2.38 dependency errors
-        uses: docker://ubuntu:20.04
-        with:
-          # Using the Literal Block Scalar (|) for clean multiline commands
-          args: |
-            /bin/bash -c "
-            # 1. Install dependencies
-            apt-get update && apt-get install -y python3 python3-pip zip wget;
-            pip install pyinstaller -r requirements.txt;
-            
-            # 2. Run PyInstaller, outputting directly to the final host path
-            pyinstaller App_PP.py --onefile --distpath ${{ github.workspace }}/build/linux --name Kaalen-v1.0;
-            
-            # 3. Define variables for clarity
-            FINAL_PATH=${{ github.workspace }}/build/linux/Kaalen-v1.0;
-            
-            # 4. FIX: Ensure executable permission is set
-            chmod +x $FINAL_PATH;
-            
-            # 5. FIX: CREATE THE .desktop FILE for double-clicking
-            echo '[Desktop Entry]' > $FINAL_PATH.desktop;
-            echo 'Name=Kaalen Spectroscopy App' >> $FINAL_PATH.desktop;
-            echo 'Comment=2D Spectroscopy Data Analysis Tool' >> $FINAL_PATH.desktop;
-            echo 'Exec=./Kaalen-v1.0' >> $FINAL_PATH.desktop;
-            echo 'Icon=icon.ico' >> $FINAL_PATH.desktop; 
-            echo 'Terminal=false' >> $FINAL_PATH.desktop;
-            echo 'Type=Application' >> $FINAL_PATH.desktop;
-            
-            # 6. Include the icon file
-            cp icon.ico ${{ github.workspace }}/build/linux/icon.ico;
-            "
-        env: 
-          LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libstdc++.so.6
-
-      # ----------------------------------------------------------------------
-      # WINDOWS / MACOS BUILD STEPS
-      # ----------------------------------------------------------------------
-      - name: Set up Python (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Install PyInstaller and dependencies (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
+
+      - name: Install PyInstaller and dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install -r requirements.txt
       
-      - name: Build with PyInstaller (Windows/macOS)
-        if: ${{ matrix.os != 'ubuntu-latest' }}
+      - name: Build with PyInstaller
         run: |
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
             pyinstaller App_PP.py --noconsole --onefile --distpath build/windows --name Kaalen-v1.0 --icon icon.ico
           elif [ "${{ matrix.os }}" == "macos-latest" ]; then
             pyinstaller App_PP.py --windowed --onefile --distpath build/macos --name Kaalen-v1.0 --icon icon.ico
+          elif [ "${{ matrix.os }}" == "ubuntu-22.04" ]; then
+            # 1. Run PyInstaller
+            pyinstaller App_PP.py --onefile --distpath build/linux --name Kaalen-v1.0
+            
+            # 2. FIX 1: Explicitly set executable permission for Linux binary 
+            chmod +x build/linux/Kaalen-v1.0
+            
+            # 3. FIX 2: CREATE THE .desktop FILE for double-clicking
+            # Use printf for clean multi-line file creation
+            printf "[Desktop Entry]\nName=Kaalen Spectroscopy App\nComment=2D Spectroscopy Data Analysis Tool\nExec=./Kaalen-v1.0\nIcon=icon.ico\nTerminal=false\nType=Application\n" > build/linux/Kaalen-v1.0.desktop
+            
+            # 4. FIX 3: Copy the icon into the artifact directory
+            cp icon.ico build/linux/icon.ico
           fi
         shell: bash
 
@@ -96,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      
+
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -115,7 +83,8 @@ jobs:
 
       - name: Zip Linux artifact
         run: |
-          cd artifacts/Kaalen-ubuntu-latest 
+          # The uploaded artifact name is Kaalen-ubuntu-22.04
+          cd artifacts/Kaalen-ubuntu-22.04 
           zip -r ../../Kaalen-linux.zip .
 
       - name: Create Release
