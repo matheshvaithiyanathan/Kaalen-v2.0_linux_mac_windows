@@ -41,6 +41,13 @@ print(f"PyQtGraph Version: {pg.__version__}")
 print(f"Scipy Version: {scipy.__version__}")
 print(f"LMFIT Version: {lmfit.__version__}")
 
+#Matplotlib Version: 3.10.6
+#PyQt5 Version: 5.15.11
+#Pandas Version: 2.3.3
+#NumPy Version: 2.3.5
+#PyQtGraph Version: 0.14.0
+#Scipy Version: 1.16.3
+#LMFIT Version: 1.3.4
 
 def find(in_array, target_value):
     array = in_array
